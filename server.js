@@ -109,6 +109,11 @@ CREATE TABLE IF NOT EXISTS purchase_splits (
   PRIMARY KEY (purchase_id, member_id)
 );
 CREATE INDEX IF NOT EXISTS idx_splits_member ON purchase_splits(member_id);
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS steam_cache (
   appid INTEGER PRIMARY KEY,
   name TEXT NOT NULL DEFAULT '',
@@ -117,6 +122,7 @@ CREATE TABLE IF NOT EXISTS steam_cache (
   updated_at INTEGER NOT NULL
 );
 `);
+try { db.exec("ALTER TABLE purchases ADD COLUMN release_date TEXT NOT NULL DEFAULT ''"); } catch {}
 
 // migração da versão com usuários: senha única herda o hash do 1º usuário,
 // tabelas users/sessions antigas são removidas, created_by sai de purchases.
@@ -425,7 +431,36 @@ async function steamAppDetails(appid) {
     initial_price_cents: po && Number.isInteger(po.initial) ? po.initial : null,
     discount_pct: po && Number.isInteger(po.discount_percent) ? po.discount_percent : 0,
     currency: po ? String(po.currency || "BRL") : "BRL",
+    // data de lançamento: vem localizada em pt-BR ("18 mai. 2015") por causa do
+    // l=portuguese; normaliza para YYYY-MM-DD. Vago/sem dia exato -> null.
+    release_date: parseSteamReleaseDate(d.release_date && d.release_date.date),
   };
+}
+// "18 mai. 2015" -> "2015-05-18". Meses pt-BR com/sem ponto; dia sempre numérico.
+// Formatos vagos ("2026", "4º trim. de 2026", "Em breve") -> null.
+function parseSteamReleaseDate(s) {
+  if (typeof s !== "string") return null;
+  const m = s.trim().toLowerCase().match(/^(\d{1,2})\s+([a-zç]{3,9})\.?\s+(\d{4})$/);
+  if (!m) return null;
+  const months = { jan: 1, fev: 2, mar: 3, abr: 4, mai: 5, jun: 6, jul: 7, ago: 8, set: 9, out: 10, nov: 11, dez: 12 };
+  const mo = months[m[2].slice(0, 3)];
+  if (!mo) return null;
+  const dd = Number(m[1]), yy = Number(m[3]);
+  if (dd < 1 || dd > 31 || yy < 1980 || yy > 2100) return null;
+  const iso = `${yy}-${String(mo).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
+  const chk = new Date(iso + "T12:00:00Z");
+  if (Number.isNaN(chk.getTime()) || chk.getUTCFullYear() !== yy || chk.getUTCMonth() + 1 !== mo || chk.getUTCDate() !== dd) return null;
+  return iso;
+}
+function validReleaseDate(s) {
+  if (!s) return "";
+  if (typeof s !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const d = new Date(s + "T12:00:00Z");
+  if (Number.isNaN(d.getTime())) return null;
+  const [yy, mo, dd] = s.split("-").map(Number);
+  if (d.getUTCFullYear() !== yy || d.getUTCMonth() + 1 !== mo || d.getUTCDate() !== dd) return null;
+  if (yy < 1980 || yy > 2100) return null;
+  return s;
 }
 const searchCache = new Map(); // termo -> {at, data}
 async function steamSearchRaw(term, cc) {
@@ -506,6 +541,37 @@ function ranked(items, valueKey = "value") {
     return { ...e, rank };
   });
 }
+// ano mais recente com ao menos uma compra (null se banco vazio)
+function latestYearWithPurchases() {
+  try {
+    const r = db.prepare("SELECT substr(purchase_date,1,4) AS y FROM purchases ORDER BY purchase_date DESC LIMIT 1").get();
+    return r ? Number(r.y) : null;
+  } catch { return null; }
+}
+// selos por membro a partir dos rankings de um ano (só rank 1, empates incluídos).
+// statsForYear retorna ready:false sem rankings quando o ano está vazio.
+function badgesForYear(year) {
+  const out = new Map();
+  if (!year) return out;
+  const st = statsForYear(year);
+  if (!st.ready) return out;
+  const give = (list, badge, zeroKey = null) => {
+    for (const e of list || []) {
+      if (e.rank !== 1) break; // lista ordenada: após rank 1 só vêm ranks maiores
+      // empate em zero não é liderança (ex: ano com preços zerados) — ninguém leva
+      if (zeroKey && !(e[zeroKey] > 0)) break;
+      if (!out.has(e.member_id)) out.set(e.member_id, []);
+      out.get(e.member_id).push(badge);
+    }
+  };
+  give(st.buyers, "Comprador do Ano");
+  give(st.spenders, "Cofre Aberto", "cents");
+  give(st.givers, "Maior Presenteador");
+  give(st.receivers, "Favorito da Família");
+  give(st.splits, "Rei dos Rachas");
+  give(st.compulsive, "Sem Freio");
+  return out;
+}
 const brl = (cents) => (cents / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 const byName = (a, b) => a.name.localeCompare(b.name, "pt-BR");
 
@@ -570,6 +636,25 @@ function statsForYear(year) {
   const total = rows.length;
   const totalCents = rows.reduce((s, r) => s + (r.price_paid_cents || 0), 0);
   const freeCount = rows.filter((r) => (r.price_paid_cents || 0) === 0).length;
+
+  // comparação com o ano anterior (totais cheios, sem rateio — mesmo critério do total).
+  // Sem compras no ano anterior -> null. Ano anterior zerado (só grátis) -> pctChange null.
+  let previousYearComparison = null;
+  {
+    const py = String(Number(y) - 1);
+    let prev = null;
+    try {
+      prev = db.prepare("SELECT COUNT(*) AS c, COALESCE(SUM(price_paid_cents),0) AS s FROM purchases WHERE substr(purchase_date,1,4) = ?").get(py);
+    } catch {}
+    if (prev && prev.c > 0) {
+      const pctChange = prev.s > 0 ? Math.round((totalCents - prev.s) / prev.s * 1000) / 10 : null;
+      previousYearComparison = {
+        year: Number(y), previousYear: Number(py),
+        totalCents, previousTotalCents: prev.s, pctChange,
+        totalGames: total, previousTotalGames: prev.c,
+      };
+    }
+  }
 
   // por mês (12 meses sempre, para "mais/menos" ser honesto)
   const perMonth = Array.from({ length: 12 }, (_, i) => ({ month: i + 1, label: MONTHS_PT[i], short: MONTHS_SHORT[i], count: 0, cents: 0 }));
@@ -678,10 +763,50 @@ function statsForYear(year) {
     const counts = new Map();
     for (const r of inMonth) counts.set(r.buyer_member_id, (counts.get(r.buyer_member_id) || 0) + 1);
     const top = Math.max(...counts.values());
-    const tops = [...counts.entries()].filter(([, c]) => c === top).map(([id]) => meta[id] || { name: "?", avatar: "" });
+    const tops = [...counts.entries()].filter(([, c]) => c === top).map(([id]) => ({ member_id: id, ...(meta[id] || { name: "?", avatar: "" }) }));
     tops.sort(byName);
     return { month: m.month, label: m.label, short: m.short, count: m.count, cents: m.cents, topCount: top, tops };
   });
+
+  // maior pausa sem comprar nada: maior intervalo em dias entre duas datas
+  // distintas com compra (deduplica compras no mesmo dia; gap 0 é ignorado).
+  // Empate: vale o intervalo mais antigo. <2 datas distintas -> null.
+  let longestGap = null;
+  {
+    const days = [...new Set(rows.map((r) => r.purchase_date))].sort();
+    let best = null;
+    for (let i = 1; i < days.length; i++) {
+      const a = days[i - 1].split("-").map(Number), b = days[i].split("-").map(Number);
+      const gap = Math.round((Date.UTC(b[0], b[1] - 1, b[2]) - Date.UTC(a[0], a[1] - 1, a[2])) / 86400000);
+      if (!best || gap > best.days) best = { days: gap, from: days[i - 1], to: days[i] };
+    }
+    longestGap = best;
+  }
+
+  // jogo mais aguardado: menor intervalo release_date -> purchase_date no ano.
+  // Só jogos com release_date preenchida participam; sem nenhum -> null.
+  // Pré-venda (purchase antes do lançamento) dá negativo e vence (menor valor).
+  // Empate: compra mais antiga primeiro.
+  let mostAnticipated = null;
+  {
+    let best = null;
+    for (const r of rows) {
+      if (!r.release_date) continue;
+      const a = r.release_date.split("-").map(Number), b = r.purchase_date.split("-").map(Number);
+      const gap = Math.round((Date.UTC(b[0], b[1] - 1, b[2]) - Date.UTC(a[0], a[1] - 1, a[2])) / 86400000);
+      if (!best || gap < best.days_after_release ||
+        (gap === best.days_after_release && (r.purchase_date < best.purchase_date || (r.purchase_date === best.purchase_date && r.id < best.id)))) {
+        best = {
+          id: r.id, game_name: r.game_name, header_image: r.header_image,
+          release_date: r.release_date, purchase_date: r.purchase_date,
+          days_after_release: gap,
+          buyer_name: r.buyer_name,
+          buyer_avatar: (meta[r.buyer_member_id] || {}).avatar || "",
+        };
+      }
+    }
+    mostAnticipated = best;
+  }
 
   // top 5 jogos mais caros do ano
   const priciest = [...rows]
@@ -692,7 +817,11 @@ function statsForYear(year) {
   const out = {
     ready: true, year,
     total, totalCents, freeCount,
+    // preço médio = total gasto no ano ÷ nº de jogos (INCLUI grátis/preço zero —
+    // mesma base do card "ticket médio" do frontend; grátis puxa a média para baixo).
+    // Ex 2026: 196906 ÷ 78 = 2524 (R$ 25,24); só pagos seria 196906 ÷ 63 = 3126.
     avgCents: Math.round(totalCents / total),
+    avgPaidCents: total - freeCount > 0 ? Math.round(totalCents / (total - freeCount)) : null,
     mostMonths: mostMonths.map((m) => ({ month: m.month, label: m.label, count: m.count })),
     leastMonths: leastMonths.map((m) => ({ month: m.month, label: m.label, count: m.count })),
     perMonth,
@@ -702,6 +831,9 @@ function statsForYear(year) {
     giftCount: rows.filter((r) => r.is_gift).length,
     splitCount,
     priciest,
+    longestGap,
+    previousYearComparison,
+    mostAnticipated,
   };
   return out;
 }
@@ -826,15 +958,112 @@ async function handler(req, res) {
 
   // ---- membros da família ----
   if (p === "/api/members" && method === "GET") {
+    // Com ?year=, TODOS os campos respeitam o ano (bought/gifted/split_in/spent_cents
+    // descrevem o mesmo período). Sem ?year=, tudo é acumulado de todos os anos.
+    // spent_cents = soma das partes do comprador no rateio (mesma regra do stats).
+    const yq = url.searchParams.get("year");
+    let yf = null;
+    if (yq !== null && yq !== "") {
+      yf = validYear(yq);
+      if (!yf) return json(res, 400, { error: "ano inválido" }, req);
+    }
+    const yLit = yf ? `'${yf}'` : null; // yf é inteiro validado — interpolação segura
+    const yCond = (col) => (yLit ? `AND substr(${col},1,4) = ${yLit}` : "");
     const members = db.prepare(`
       SELECT m.id, m.name, m.avatar,
-        (SELECT COUNT(*) FROM purchases WHERE buyer_member_id = m.id) AS bought,
-        (SELECT COUNT(*) FROM purchases WHERE is_gift = 1 AND buyer_member_id = m.id) AS gifted,
-        (SELECT COUNT(*) FROM purchases p WHERE p.buyer_member_id = m.id AND EXISTS (SELECT 1 FROM purchase_splits ps WHERE ps.purchase_id = p.id)) +
-        (SELECT COUNT(*) FROM purchase_splits WHERE member_id = m.id) AS split_in
-      FROM members m ORDER BY m.name COLLATE NOCASE ASC`).all()
-      .map((m) => ({ ...m, avatar_url: avatarUrl(m.avatar) }));
-    return json(res, 200, { members }, req);
+        (SELECT COUNT(*) FROM purchases WHERE buyer_member_id = m.id ${yCond("purchase_date")}) AS bought,
+        (SELECT COUNT(*) FROM purchases WHERE is_gift = 1 AND buyer_member_id = m.id ${yCond("purchase_date")}) AS gifted,
+        (SELECT COUNT(*) FROM purchases p WHERE p.buyer_member_id = m.id ${yCond("p.purchase_date")} AND EXISTS (SELECT 1 FROM purchase_splits ps WHERE ps.purchase_id = p.id)) +
+        (SELECT COUNT(*) FROM purchase_splits ps JOIN purchases p ON p.id = ps.purchase_id WHERE ps.member_id = m.id ${yCond("p.purchase_date")}) AS split_in
+      FROM members m ORDER BY m.name COLLATE NOCASE ASC`).all();
+    // soma da parte do comprador (preço / nº de participantes do racha)
+    const cond = yf ? "WHERE substr(p.purchase_date,1,4) = ?" : "";
+    const args = yf ? [String(yf)] : [];
+    const prows = db.prepare(`SELECT id, buyer_member_id, price_paid_cents FROM purchases p ${cond}`).all(...args);
+    const srows = db.prepare(`
+      SELECT ps.purchase_id, ps.member_id FROM purchase_splits ps
+      JOIN purchases p ON p.id = ps.purchase_id ${cond}`).all(...args);
+    const extraByPid = new Map();
+    for (const s of srows) {
+      if (!extraByPid.has(s.purchase_id)) extraByPid.set(s.purchase_id, []);
+      extraByPid.get(s.purchase_id).push(s.member_id);
+    }
+    const spentBy = new Map();
+    for (const r of prows) {
+      const extra = (extraByPid.get(r.id) || []).filter((id) => id !== r.buyer_member_id);
+      const n = 1 + extra.length;
+      const price = r.price_paid_cents || 0;
+      // sobra de centavos vai para o comprador (primeiro da lista)
+      const share = Math.floor(price / n) + (price % n > 0 ? 1 : 0);
+      spentBy.set(r.buyer_member_id, (spentBy.get(r.buyer_member_id) || 0) + share);
+    }
+    // selos: 1º lugar (rank 1, inclui empates) nos rankings do ano de referência.
+    // Com ?year= usa esse ano; sem ?year=, o ano mais recente com compras.
+    // Lista aprovada: Comprador do Ano (buyers), Cofre Aberto (spenders),
+    // Maior Presenteador (givers), Favorito da Família (receivers),
+    // Rei dos Rachas (splits), Sem Freio (compulsive).
+    // Ideia guardada: flag is_presale p/ mostAnticipated com data suspeita da Steam.
+    const badgeYear = yf || latestYearWithPurchases();
+    const badgesBy = badgesForYear(badgeYear);
+    const out = members.map((m) => ({ ...m, avatar_url: avatarUrl(m.avatar), spent_cents: spentBy.get(m.id) || 0, badges: badgesBy.get(m.id) || [] }));
+    return json(res, 200, { members: out, year: yf, badge_year: badgeYear }, req);
+  }
+  // ---- comparação lado a lado de dois membros ----
+  // GET /api/members/compare?a=1&b=2[&year=2026]
+  // Sem ?year=, tudo acumulado; com ?year=, todos os campos filtram pelo ano.
+  // cents = parte do comprador no rateio; received_* = presentes recebidos (valor cheio).
+  if (p === "/api/members/compare" && method === "GET") {
+    const aq = url.searchParams.get("a"), bq = url.searchParams.get("b");
+    if (!aq || !bq || !/^\d+$/.test(aq) || !/^\d+$/.test(bq)) {
+      return json(res, 400, { error: "informe ?a=<id>&b=<id> (ids de membros)" }, req);
+    }
+    const aid = Number(aq), bid = Number(bq);
+    const ma = db.prepare("SELECT id, name, avatar FROM members WHERE id=?").get(aid);
+    const mb = db.prepare("SELECT id, name, avatar FROM members WHERE id=?").get(bid);
+    if (!ma || !mb) return json(res, 404, { error: "membro não encontrado" }, req);
+    const yq = url.searchParams.get("year");
+    let yf = null;
+    if (yq !== null && yq !== "") {
+      yf = validYear(yq);
+      if (!yf) return json(res, 400, { error: "ano inválido" }, req);
+    }
+    const yLit = yf ? `'${yf}'` : null; // yf é inteiro validado — interpolação segura
+    const yCond = (col) => (yLit ? `AND substr(${col},1,4) = ${yLit}` : "");
+    const side = (mm) => {
+      const id = mm.id;
+      const bought = db.prepare(`SELECT COUNT(*) c FROM purchases WHERE buyer_member_id=? ${yCond("purchase_date")}`).get(id).c;
+      const gifted = db.prepare(`SELECT COUNT(*) c FROM purchases WHERE is_gift=1 AND buyer_member_id=? ${yCond("purchase_date")}`).get(id).c;
+      const giftedCents = db.prepare(`SELECT COALESCE(SUM(price_paid_cents),0) s FROM purchases WHERE is_gift=1 AND buyer_member_id=? ${yCond("purchase_date")}`).get(id).s;
+      const received = db.prepare(`SELECT COUNT(*) c FROM purchases WHERE is_gift=1 AND gift_to_member_id=? ${yCond("purchase_date")}`).get(id).c;
+      const receivedCents = db.prepare(`SELECT COALESCE(SUM(price_paid_cents),0) s FROM purchases WHERE is_gift=1 AND gift_to_member_id=? ${yCond("purchase_date")}`).get(id).s;
+      // rachas: compras próprias rachadas + participações em rachas alheias
+      const splitStarted = db.prepare(`SELECT COUNT(*) c FROM purchases p WHERE p.buyer_member_id=? ${yCond("p.purchase_date")} AND EXISTS (SELECT 1 FROM purchase_splits ps WHERE ps.purchase_id=p.id)`).get(id).c;
+      const splitJoined = db.prepare(`SELECT COUNT(*) c FROM purchase_splits ps JOIN purchases p ON p.id=ps.purchase_id WHERE ps.member_id=? ${yCond("p.purchase_date")}`).get(id).c;
+      // gasto: parte do comprador no rateio (mesma regra de /api/members e stats)
+      const prows = db.prepare(`SELECT id, price_paid_cents FROM purchases WHERE buyer_member_id=? ${yCond("purchase_date")}`).all(id);
+      const extraByPid = new Map();
+      if (prows.length) {
+        const ph = prows.map(() => "?").join(",");
+        for (const s of db.prepare(`SELECT purchase_id, member_id FROM purchase_splits WHERE purchase_id IN (${ph})`).all(...prows.map((r) => r.id))) {
+          if (s.member_id === id) continue;
+          if (!extraByPid.has(s.purchase_id)) extraByPid.set(s.purchase_id, 0);
+          extraByPid.set(s.purchase_id, extraByPid.get(s.purchase_id) + 1);
+        }
+      }
+      let cents = 0;
+      for (const r of prows) {
+        const n = 1 + (extraByPid.get(r.id) || 0);
+        const price = r.price_paid_cents || 0;
+        cents += Math.floor(price / n) + (price % n > 0 ? 1 : 0);
+      }
+      return {
+        id: mm.id, name: mm.name, avatar: mm.avatar, avatar_url: avatarUrl(mm.avatar),
+        bought, cents, gifted, gifted_cents: giftedCents,
+        received, received_cents: receivedCents,
+        splits: splitStarted + splitJoined, splits_started: splitStarted, splits_joined: splitJoined,
+      };
+    };
+    return json(res, 200, { a: side(ma), b: side(mb), year: yf }, req);
   }
   if (p === "/api/members" && method === "POST") {
     let body; try { body = await readJson(req); } catch (e) { return json(res, e.code === 413 ? 413 : 400, { error: e.message }, req); }
@@ -1100,6 +1329,34 @@ async function handler(req, res) {
     return json(res, 200, { years }, req);
   }
 
+  // ---- temporizador da próxima promoção Steam (tabela settings) ----
+  // GET público (logado): { next_sale_at: ISO|null, label: string }
+  // PUT (CSRF): body { next_sale_at: ISO|null|"", label?: string }
+  if (p === "/api/settings/next-sale" && (method === "GET" || method === "PUT")) {
+    const get = (k) => { try { return db.prepare("SELECT value FROM settings WHERE key=?").get(k)?.value ?? null; } catch { return null; } };
+    if (method === "GET") {
+      const at = get("next_sale_at") || null;
+      return json(res, 200, { next_sale_at: at, label: get("next_sale_label") || "" }, req);
+    }
+    let body; try { body = await readJson(req); } catch (e) { return json(res, e.code === 413 ? 413 : 400, { error: e.message }, req); }
+    let at = body.next_sale_at ?? null;
+    if (at === "") at = null;
+    if (at !== null) {
+      if (typeof at !== "string") return json(res, 400, { error: "next_sale_at inválido (use ISO-8601 ou null para limpar)" }, req);
+      const d = new Date(at);
+      if (Number.isNaN(d.getTime())) return json(res, 400, { error: "next_sale_at inválido (use ISO-8601 ou null para limpar)" }, req);
+      at = d.toISOString();
+    }
+    const label = typeof body.label === "string" ? body.label.trim().replace(/\s+/g, " ").slice(0, 80) : "";
+    const now = Date.now();
+    db.prepare("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at")
+      .run("next_sale_at", at || "", now);
+    db.prepare("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at")
+      .run("next_sale_label", label, now);
+    audit(ip, "familia", "next_sale_update", `${at || "limpo"} ${label}`.slice(0, 120));
+    return json(res, 200, { ok: true, next_sale_at: at, label }, req);
+  }
+
   // ---- compras ----
   if (p === "/api/purchases" && method === "GET") {
     const y = url.searchParams.get("year");
@@ -1155,7 +1412,23 @@ async function handler(req, res) {
       for (const id of split_with) if (!memberExists(id)) return { error: "membro do racha não existe" };
     }
     const note = String(body.note || "").slice(0, 500);
-    return { appid, game_name, header_image, steam_url, buyer_member_id, purchase_date, price_paid_cents, price_source, is_gift, gift_to_member_id, split_with, note };
+    // release_date: manual (YYYY-MM-DD) ou herdada do lookup da Steam.
+    // Sem data confiável -> "" (jogo fica fora do mostAnticipated).
+    let release_date = validReleaseDate(body.release_date);
+    if (release_date === null) return { error: "data de lançamento inválida (use YYYY-MM-DD)" };
+    if (!release_date && appid) {
+      release_date = lookupReleaseDate(appid);
+    }
+    return { appid, game_name, header_image, steam_url, buyer_member_id, purchase_date, price_paid_cents, price_source, is_gift, gift_to_member_id, split_with, note, release_date };
+  }
+  // data de lançamento guardada no cache da Steam (evita HTTP no cadastro)
+  function lookupReleaseDate(appid) {
+    try {
+      const c = db.prepare("SELECT payload FROM steam_cache WHERE appid=?").get(appid);
+      if (!c) return "";
+      const p = JSON.parse(c.payload || "{}");
+      return validReleaseDate(p.release_date) || "";
+    } catch { return ""; }
   }
 
   if (p === "/api/purchases" && method === "POST") {
@@ -1167,8 +1440,8 @@ async function handler(req, res) {
     if (v.error) return json(res, 400, { error: v.error }, req);
     const now = Date.now();
     const r = db.prepare(`
-      INSERT INTO purchases(appid,game_name,header_image,steam_url,buyer_member_id,purchase_date,price_paid_cents,price_source,is_gift,gift_to_member_id,note,created_at,updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(v.appid, v.game_name, v.header_image, v.steam_url, v.buyer_member_id, v.purchase_date, v.price_paid_cents, v.price_source, v.is_gift, v.gift_to_member_id, v.note, now, now);
+      INSERT INTO purchases(appid,game_name,header_image,steam_url,buyer_member_id,purchase_date,price_paid_cents,price_source,is_gift,gift_to_member_id,note,release_date,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(v.appid, v.game_name, v.header_image, v.steam_url, v.buyer_member_id, v.purchase_date, v.price_paid_cents, v.price_source, v.is_gift, v.gift_to_member_id, v.note, v.release_date, now, now);
     const pid = Number(r.lastInsertRowid);
     for (const mid of v.split_with) db.prepare("INSERT INTO purchase_splits(purchase_id,member_id) VALUES(?,?)").run(pid, mid);
     audit(ip, "familia", "purchase_create", `${v.game_name} (${v.purchase_date})`);
@@ -1181,8 +1454,8 @@ async function handler(req, res) {
     const v = parsePurchaseBody(body);
     if (v.error) return json(res, 400, { error: v.error }, req);
     db.prepare(`
-      UPDATE purchases SET appid=?, game_name=?, header_image=?, steam_url=?, buyer_member_id=?, purchase_date=?, price_paid_cents=?, price_source=?, is_gift=?, gift_to_member_id=?, note=?, updated_at=? WHERE id=?`)
-      .run(v.appid, v.game_name, v.header_image, v.steam_url, v.buyer_member_id, v.purchase_date, v.price_paid_cents, v.price_source, v.is_gift, v.gift_to_member_id, v.note, Date.now(), id);
+      UPDATE purchases SET appid=?, game_name=?, header_image=?, steam_url=?, buyer_member_id=?, purchase_date=?, price_paid_cents=?, price_source=?, is_gift=?, gift_to_member_id=?, note=?, release_date=?, updated_at=? WHERE id=?`)
+      .run(v.appid, v.game_name, v.header_image, v.steam_url, v.buyer_member_id, v.purchase_date, v.price_paid_cents, v.price_source, v.is_gift, v.gift_to_member_id, v.note, v.release_date, Date.now(), id);
     db.prepare("DELETE FROM purchase_splits WHERE purchase_id=?").run(id);
     for (const mid of v.split_with) db.prepare("INSERT INTO purchase_splits(purchase_id,member_id) VALUES(?,?)").run(id, mid);
     audit(ip, "familia", "purchase_update", `id=${id} ${v.game_name}`);
@@ -1200,6 +1473,41 @@ async function handler(req, res) {
     const y = validYear(url.searchParams.get("year") || new Date().getFullYear());
     if (!y) return json(res, 400, { error: "ano inválido" }, req);
     return json(res, 200, statsForYear(y), req);
+  }
+
+  // ---- backfill de release_date: preenche em lotes os jogos com appid e sem data ----
+  // POST (CSRF) body { limit?: 1..50 }. Consulta appdetails (via cache), parseia e salva.
+  // Jogos sem appid, delistados ou com data vaga ficam NULL de propósito (fora do mostAnticipated).
+  if (p === "/api/steam/backfill-release-dates" && method === "POST") {
+    let body; try { body = await readJson(req); } catch (e) { return json(res, e.code === 413 ? 413 : 400, { error: e.message }, req); }
+    const limit = Math.min(50, Math.max(1, Number(body.limit) || 20));
+    const targets = db.prepare("SELECT id, appid, game_name FROM purchases WHERE appid > 0 AND (release_date IS NULL OR release_date = '') ORDER BY id ASC LIMIT ?").all(limit);
+    const out = { checked: targets.length, updated: 0, skipped: 0, failed: [], remaining: 0 };
+    for (const t of targets) {
+      try {
+        let info = null;
+        const cached = getCachedSteam(t.appid);
+        if (cached && cached.payload && cached.payload.release_date) {
+          info = cached.payload;
+        } else {
+          info = await steamAppDetails(t.appid);
+          db.prepare("INSERT INTO steam_cache(appid,name,header_image,payload,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(appid) DO UPDATE SET name=excluded.name, header_image=excluded.header_image, payload=excluded.payload, updated_at=excluded.updated_at")
+            .run(t.appid, info.name, info.header_image, JSON.stringify(info), Date.now());
+        }
+        if (info.release_date) {
+          db.prepare("UPDATE purchases SET release_date=?, updated_at=? WHERE id=?").run(info.release_date, Date.now(), t.id);
+          out.updated += 1;
+        } else {
+          out.skipped += 1;
+        }
+      } catch (e) {
+        out.failed.push({ id: t.id, game_name: t.game_name, error: String(e.message || e).slice(0, 120) });
+      }
+      await new Promise((r) => setTimeout(r, 400)); // respira entre chamadas p/ não tomar rate-limit
+    }
+    try { out.remaining = db.prepare("SELECT COUNT(*) c FROM purchases WHERE appid > 0 AND (release_date IS NULL OR release_date = '')").get().c; } catch {}
+    audit(ip, "familia", "backfill_release", `upd=${out.updated} skip=${out.skipped} fail=${out.failed.length} rest=${out.remaining}`);
+    return json(res, 200, { ok: true, ...out }, req);
   }
 
   // ---- export CSV ----
