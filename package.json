@@ -1,0 +1,15 @@
+{
+  "name": "familia-steam",
+  "version": "1.0.0",
+  "description": "Retrospectiva da Família Steam: quem comprou, presentes, rachas e rankings por ano",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "init-admin": "node server.js --init-admin"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
