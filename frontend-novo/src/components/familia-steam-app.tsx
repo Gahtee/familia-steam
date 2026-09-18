@@ -62,6 +62,7 @@ import {
   type RankingEntry,
   type Stats,
   type SteamResult,
+  type CompareSide,
 } from "@/lib/familia-api";
 
 type View = "wrapped" | "games" | "family" | "settings";
@@ -134,7 +135,7 @@ export function FamiliaSteamApp() {
     <AppShell view={view} onView={setView} onLogout={() => setAuth("signed-out")}>
       {view === "wrapped" && <WrappedView year={year} years={years} onYear={setYear} onAddGame={() => setView("games")} />}
       {view === "games" && <GamesView year={year} years={years} onYear={setYear} />}
-      {view === "family" && <FamilyView />}
+      {view === "family" && <FamilyView year={year} years={years} onYear={setYear} />}
       {view === "settings" && <SettingsView year={year} years={years} onYear={setYear} onLogout={() => setAuth("signed-out")} />}
     </AppShell>
   );
@@ -303,6 +304,7 @@ function WrappedView({ year, years, onYear, onAddGame }: { year: number; years: 
             <span><strong className="font-display text-record">{stats.giftCount}</strong> presentes</span>
             <span><strong className="font-display text-data">{stats.splitCount}</strong> jogos rachados</span>
             <span><strong className="font-display text-primary">{stats.freeCount}</strong> gratuitos</span>
+            <span><strong className="font-display tabular-nums text-foreground">{money.format((stats.avgCents ?? 0) / 100)}</strong> preço médio <span className="text-muted-foreground">({stats.avgPaidCents != null ? `${money.format(stats.avgPaidCents / 100)} se considerar só os pagos` : "sem pagos no ano"})</span></span>
           </div>
         </section>
 
@@ -320,7 +322,9 @@ function WrappedView({ year, years, onYear, onAddGame }: { year: number; years: 
           </div>
         </section>
 
-        <section className="grid border-b border-border lg:grid-cols-[1.15fr_.85fr]">
+        <YearPerspective stats={stats} />
+
+        <section className="grid items-start border-b border-border lg:grid-cols-[1.15fr_.85fr]">
           <div className="py-12 lg:border-r lg:border-border lg:pr-12">
             <h2 className="text-2xl font-medium">Pódio do ano</h2>
             <div className="mt-8 space-y-1">
@@ -329,6 +333,31 @@ function WrappedView({ year, years, onYear, onAddGame }: { year: number; years: 
               <RankingRow label="Quem mais gastou" entry={stats.spenders?.[0]} tone="record" moneyValue />
               <RankingRow label="Estrela dos rachados" entry={stats.splits?.[0]} tone="data" />
             </div>
+            {(stats.monthlyKings?.length ?? 0) > 0 && (
+              <div className="mt-12">
+                <h2 className="text-2xl font-medium">Reis do mês</h2>
+                <p className="mt-1 text-sm text-muted-foreground">Quem mais comprou em cada mês com movimento.</p>
+                <div className="mt-6 divide-y divide-border">
+                  {stats.monthlyKings?.map((kings) => (
+                    <div key={kings.month} className="flex flex-col gap-3 py-4 sm:grid sm:grid-cols-[10rem_1fr_auto] sm:items-center sm:gap-4">
+                      <div>
+                        <p className="font-medium">{kings.label}</p>
+                        <p className="text-sm text-muted-foreground">{kings.count} {kings.count === 1 ? "jogo" : "jogos"} no mês</p>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                        {kings.tops.map((top) => (
+                          <span key={top.member_id} className="flex items-center gap-2 text-sm">
+                            <MemberAvatar name={top.name} avatar={top.avatar} className="size-8" />
+                            <span className="font-medium">{top.name}</span>
+                          </span>
+                        ))}
+                      </div>
+                      <span className="font-display tabular-nums text-muted-foreground sm:text-right" title={`${kings.topCount} ${kings.topCount === 1 ? "jogo" : "jogos"} do rei no mês`}>{kings.topCount}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
           <div className="py-12 lg:pl-12">
             <h2 className="text-2xl font-medium">A compra mais marcante</h2>
@@ -338,6 +367,27 @@ function WrappedView({ year, years, onYear, onAddGame }: { year: number; years: 
                 <div className="p-5"><p className="text-xl font-semibold">{priciest.game_name}</p><div className="mt-4 flex items-end justify-between gap-3"><span className="text-sm text-muted-foreground">{priciest.buyer_name}</span><span className="font-display text-2xl text-record">{money.format(priciest.cents / 100)}</span></div></div>
               </div>
             ) : <p className="mt-5 text-muted-foreground">Sem destaque neste ano.</p>}
+            <h2 className="mt-12 text-2xl font-medium">O mais aguardado</h2>
+            {stats.mostAnticipated ? (
+              <div className="mt-7 overflow-hidden rounded-md border border-border bg-card">
+                <div className="aspect-[460/215] bg-surface-soft">{stats.mostAnticipated.header_image ? <img src={stats.mostAnticipated.header_image} alt={`Capa de ${stats.mostAnticipated.game_name}`} className="h-full w-full object-cover" /> : <div className="grid h-full place-items-center text-muted-foreground"><Gamepad2 className="size-8" /><span className="sr-only">Sem capa</span></div>}</div>
+                <div className="p-5">
+                  <p className="text-xl font-semibold">{stats.mostAnticipated.game_name}</p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <Badge variant="outline" className="border-highlight/30 bg-highlight/10 text-highlight">
+                      {stats.mostAnticipated.days_after_release < 0
+                        ? `pré-venda: ${-stats.mostAnticipated.days_after_release} ${-stats.mostAnticipated.days_after_release === 1 ? "dia antes" : "dias antes"}`
+                        : stats.mostAnticipated.days_after_release === 0
+                          ? "no dia do lançamento"
+                          : `${stats.mostAnticipated.days_after_release} ${stats.mostAnticipated.days_after_release === 1 ? "dia após" : "dias após"} o lançamento`}
+                    </Badge>
+                  </div>
+                  <div className="mt-4 flex items-end justify-between gap-3">
+                    <span className="text-sm text-muted-foreground">{stats.mostAnticipated.buyer_name} · lançou em {shortDate.format(new Date(`${stats.mostAnticipated.release_date}T00:00:00Z`))}</span>
+                  </div>
+                </div>
+              </div>
+            ) : <p className="mt-5 text-muted-foreground">Sem datas de lançamento neste ano.</p>}
           </div>
         </section>
 
@@ -356,6 +406,45 @@ function RankingRow({ label, entry, tone, moneyValue }: { label: string; entry: 
       <div><p className="text-xs text-muted-foreground">{label}</p><p className="mt-0.5 font-semibold">{entry.name}</p></div>
       <p className={cn("font-display text-xl tabular-nums", toneClass)}>{moneyValue ? money.format((entry.cents ?? 0) / 100) : entry.value}</p>
     </div>
+  );
+}
+
+function YearPerspective({ stats }: { stats: Stats }) {
+  const comparison = stats.previousYearComparison;
+  const gap = stats.longestGap;
+  if (!comparison && !gap) return null;
+  return (
+    <section className="grid gap-10 border-b border-border py-12 md:grid-cols-2">
+      {comparison ? (
+        <div>
+          <h2 className="text-2xl font-medium">Contra {comparison.previousYear}</h2>
+          <p className="mt-1 text-sm text-muted-foreground">O ano lado a lado com o anterior.</p>
+          <div className="mt-6 flex flex-wrap gap-x-8 gap-y-3 text-sm">
+            <span>
+              <strong className={cn("font-display text-xl tabular-nums", (comparison.pctChange ?? 0) >= 0 ? "text-record" : "text-data")}>
+                {comparison.pctChange == null ? "—" : `${comparison.pctChange > 0 ? "+" : ""}${String(comparison.pctChange).replace(".", ",")}%`}
+              </strong>{" "}
+              em gastos
+            </span>
+            <span className="text-muted-foreground">
+              {money.format(comparison.previousTotalCents / 100)} em {comparison.previousYear} · {comparison.previousTotalGames} jogos
+            </span>
+          </div>
+        </div>
+      ) : <div />}
+      {gap ? (
+        <div>
+          <h2 className="text-2xl font-medium">A maior pausa</h2>
+          <p className="mt-1 text-sm text-muted-foreground">O intervalo mais longo sem compras no ano.</p>
+          <p className="mt-6 font-display text-xl tabular-nums">
+            {gap.days} {gap.days === 1 ? "dia" : "dias"}
+            <span className="ml-3 text-sm font-normal text-muted-foreground">
+              {shortDate.format(new Date(`${gap.from}T00:00:00Z`))} → {shortDate.format(new Date(`${gap.to}T00:00:00Z`))}
+            </span>
+          </p>
+        </div>
+      ) : <div />}
+    </section>
   );
 }
 
@@ -457,18 +546,18 @@ function GameDialog({ open, onOpenChange, members, purchase, onSaved }: { open: 
   );
 }
 
-function FamilyView() {
+function FamilyView({ year, years, onYear }: { year: number; years: number[]; onYear: (year: number) => void }) {
   const [members, setMembers] = useState<Member[]>([]);
   const [loading, setLoading] = useState(true);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<Member | null>(null);
-  const load = useCallback(async () => { setLoading(true); try { setMembers((await api.members()).members); } catch (error) { toast.error(errorText(error)); } finally { setLoading(false); } }, []);
+  const load = useCallback(async () => { setLoading(true); try { setMembers((await api.members(year)).members); } catch (error) { toast.error(errorText(error)); } finally { setLoading(false); } }, [year]);
   useEffect(() => { void load(); }, [load]);
   async function remove(member: Member) { if (!window.confirm(`Excluir ${member.name}?`)) return; try { await api.deleteMember(member.id); toast.success("Membro excluído."); await load(); } catch (error) { toast.error(errorText(error)); } }
   return (
     <div className="page-enter">
-      <PageHeader title="Família" description="As pessoas por trás da biblioteca." actions={<Button onClick={() => { setEditing(null); setDialogOpen(true); }}><Plus /> Novo membro</Button>} />
-      <div className="px-5 sm:px-8 lg:px-12">{loading ? <RowsSkeleton /> : members.length === 0 ? <EmptyState icon={Users} title="A família começa aqui" description="Cadastre alguém antes de registrar o primeiro jogo." action={<Button onClick={() => setDialogOpen(true)}><Plus /> Novo membro</Button>} /> : <div className="divide-y divide-border">{members.map((member, index) => <article key={member.id} className="grid grid-cols-[auto_1fr_auto] items-center gap-5 py-7 sm:gap-8"><div className="relative"><MemberAvatar name={member.name} avatar={member.avatar_url} className="size-16 sm:size-20" /><span className="absolute -bottom-1 -right-1 grid size-6 place-items-center rounded-full bg-card font-display text-xs text-muted-foreground">{index + 1}</span></div><div><h2 className="text-xl font-semibold sm:text-2xl">{member.name}</h2><div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-sm text-muted-foreground"><span><strong className="text-foreground">{member.bought}</strong> compras</span><span><strong className="text-highlight">{member.gifted}</strong> presentes</span><span><strong className="text-data">{member.split_in}</strong> rachados</span></div></div><div className="flex"><Button size="icon" variant="ghost" onClick={() => { setEditing(member); setDialogOpen(true); }} aria-label={`Editar ${member.name}`}><Pencil /></Button><Button size="icon" variant="ghost" onClick={() => void remove(member)} aria-label={`Excluir ${member.name}`}><Trash2 /></Button></div></article>)}</div>}</div>
+      <PageHeader title="Família" description={`As pessoas por trás da biblioteca em ${year}.`} actions={<><YearSelect year={year} years={years} onYear={onYear} /><Button onClick={() => { setEditing(null); setDialogOpen(true); }}><Plus /> Novo membro</Button></>} />
+      <div className="px-5 sm:px-8 lg:px-12">{loading ? <RowsSkeleton /> : members.length === 0 ? <EmptyState icon={Users} title="A família começa aqui" description="Cadastre alguém antes de registrar o primeiro jogo." action={<Button onClick={() => setDialogOpen(true)}><Plus /> Novo membro</Button>} /> : <><div className="divide-y divide-border">{members.map((member, index) => <article key={member.id} className="grid grid-cols-[auto_1fr_auto] items-center gap-5 py-7 sm:gap-8"><div className="relative"><MemberAvatar name={member.name} avatar={member.avatar_url} className="size-16 sm:size-20" /><span className="absolute -bottom-1 -right-1 grid size-6 place-items-center rounded-full bg-card font-display text-xs text-muted-foreground">{index + 1}</span></div><div><h2 className="text-xl font-semibold sm:text-2xl">{member.name}</h2>{(member.badges?.length ?? 0) > 0 && <div className="mt-2 flex flex-wrap gap-1.5">{member.badges?.map((badge) => <Badge key={badge} variant="outline" className="border-primary/30 bg-primary/10 text-primary"><Medal className="mr-1 size-3" />{badge}</Badge>)}</div>}<div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-sm text-muted-foreground"><span><strong className="text-foreground">{member.bought}</strong> compras</span><span><strong className="text-highlight">{member.gifted}</strong> presentes</span><span><strong className="text-data">{member.split_in}</strong> rachados</span><span><strong className="font-display tabular-nums text-record">{money.format((member.spent_cents ?? 0) / 100)}</strong> gastos</span></div></div><div className="flex"><Button size="icon" variant="ghost" onClick={() => { setEditing(member); setDialogOpen(true); }} aria-label={`Editar ${member.name}`}><Pencil /></Button><Button size="icon" variant="ghost" onClick={() => void remove(member)} aria-label={`Excluir ${member.name}`}><Trash2 /></Button></div></article>)}</div>{members.length >= 2 && <CompareSection members={members} year={year} />}</>}</div>
       <MemberDialog open={dialogOpen} onOpenChange={setDialogOpen} member={editing} onSaved={load} />
     </div>
   );
@@ -476,17 +565,130 @@ function FamilyView() {
 
 function MemberDialog({ open, onOpenChange, member, onSaved }: { open: boolean; onOpenChange: (open: boolean) => void; member: Member | null; onSaved: () => Promise<void> }) {
   const [name, setName] = useState(""); const [pending, setPending] = useState(false); const inputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => { if (open) setName(member?.name ?? ""); }, [open, member]);
   async function submit(event: FormEvent) { event.preventDefault(); setPending(true); try { if (member) await api.updateMember(member.id, name); else await api.addMember(name); toast.success(member ? "Membro atualizado." : "Membro adicionado."); onOpenChange(false); await onSaved(); } catch (error) { toast.error(errorText(error)); } finally { setPending(false); } }
   async function upload(file?: File) { if (!member || !file) return; setPending(true); try { const data = await imageToJpeg(file); await api.uploadAvatar(member.id, data); toast.success("Foto atualizada."); await onSaved(); onOpenChange(false); } catch (error) { toast.error(errorText(error)); } finally { setPending(false); } }
   return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent><DialogHeader><DialogTitle>{member ? `Editar ${member.name}` : "Novo membro"}</DialogTitle><DialogDescription>O nome aparece nas compras e nos rankings.</DialogDescription></DialogHeader><form onSubmit={submit} className="space-y-6">{member && <div className="flex items-center gap-5"><MemberAvatar name={member.name} avatar={member.avatar_url} className="size-20" /><div><input ref={inputRef} type="file" accept="image/jpeg,image/png,image/webp,image/gif" className="sr-only" onChange={(e) => void upload(e.target.files?.[0])} /><Button type="button" variant="outline" onClick={() => inputRef.current?.click()} disabled={pending}><Camera /> Trocar foto</Button><p className="mt-2 text-xs text-muted-foreground">JPG, PNG, WebP ou GIF. A imagem será reduzida.</p></div></div>}<div><Label htmlFor="member-name">Nome</Label><Input id="member-name" className="mt-2" value={name} onChange={(e) => setName(e.target.value)} maxLength={40} autoFocus required /></div><DialogFooter><Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>Cancelar</Button><Button disabled={pending || !name.trim()}>{pending && <LoaderCircle className="animate-spin" />}Salvar</Button></DialogFooter></form></DialogContent></Dialog>;
+}
+
+function CompareSection({ members, year }: { members: Member[]; year: number }) {
+  const [aid, setAid] = useState(members[0]?.id ?? 0);
+  const [bid, setBid] = useState(members[1]?.id ?? members[0]?.id ?? 0);
+  const [result, setResult] = useState<{ a: CompareSide; b: CompareSide } | null>(null);
+  // com 2 membros, trocar A pula B para o outro (sem cair de volta no A);
+  // com 3+, B vai para o primeiro diferente de A.
+  function pickA(id: number) {
+    setAid(id);
+    if (id === bid) setBid(members.find((item) => item.id !== id)?.id ?? id);
+  }
+  useEffect(() => {
+    if (!aid || !bid || aid === bid) return;
+    void api.compareMembers(aid, bid, year).then(setResult).catch((error) => toast.error(errorText(error)));
+  }, [aid, bid, year]);
+  const rows: Array<{ label: string; a: string; b: string }> = result ? [
+    { label: "Jogos", a: String(result.a.bought), b: String(result.b.bought) },
+    { label: "Gastos", a: money.format(result.a.cents / 100), b: money.format(result.b.cents / 100) },
+    { label: "Presentes", a: `${result.a.gifted} (${money.format(result.a.gifted_cents / 100)})`, b: `${result.b.gifted} (${money.format(result.b.gifted_cents / 100)})` },
+    { label: "Recebidos", a: `${result.a.received} (${money.format(result.a.received_cents / 100)})`, b: `${result.b.received} (${money.format(result.b.received_cents / 100)})` },
+    { label: "Rachas", a: `${result.a.splits} (${result.a.splits_started}+${result.a.splits_joined})`, b: `${result.b.splits} (${result.b.splits_started}+${result.b.splits_joined})` },
+  ] : [];
+  return (
+    <section className="border-t border-border py-12">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+        <div><h2 className="text-2xl font-medium">Comparar membros</h2><p className="mt-1 text-sm text-muted-foreground">Lado a lado em {year}.</p></div>
+        <div className="grid grid-cols-2 gap-2 sm:flex">
+          <Select value={String(aid)} onValueChange={(value) => pickA(Number(value))}><SelectTrigger className="bg-card"><SelectValue /></SelectTrigger><SelectContent>{members.map((item) => <SelectItem key={item.id} value={String(item.id)}>{item.name}</SelectItem>)}</SelectContent></Select>
+          <Select value={String(bid)} onValueChange={(value) => setBid(Number(value))}><SelectTrigger className="bg-card"><SelectValue /></SelectTrigger><SelectContent>{members.filter((item) => item.id !== aid).map((item) => <SelectItem key={item.id} value={String(item.id)}>{item.name}</SelectItem>)}</SelectContent></Select>
+        </div>
+      </div>
+      {result && (
+        <div className="mt-6">
+          <div className="grid grid-cols-[1fr_auto_auto] items-center gap-4 pb-4">
+            <span />
+            {[result.a, result.b].map((side) => (
+              <span key={side.id} className="flex w-24 flex-col items-center gap-1.5 sm:w-32">
+                <MemberAvatar name={side.name} avatar={side.avatar_url} className="size-8" />
+                <span className="max-w-full truncate text-sm font-semibold">{side.name}</span>
+              </span>
+            ))}
+          </div>
+          <div className="divide-y divide-border">
+            {rows.map((row) => (
+              <div key={row.label} className="grid grid-cols-[1fr_auto_auto] items-center gap-4 py-3">
+                <span className="text-sm text-muted-foreground">{row.label}</span>
+                <span className="w-24 text-center font-display tabular-nums sm:w-32">{row.a}</span>
+                <span className="w-24 text-center font-display tabular-nums sm:w-32">{row.b}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </section>
+  );
 }
 
 function SettingsView({ year, years, onYear, onLogout }: { year: number; years: number[]; onYear: (year: number) => void; onLogout: () => void }) {
   const [current, setCurrent] = useState(""); const [next, setNext] = useState(""); const [confirm, setConfirm] = useState(""); const [pending, setPending] = useState(false);
   async function changePassword(event: FormEvent) { event.preventDefault(); if (next !== confirm) { toast.error("As novas senhas não coincidem."); return; } setPending(true); try { await api.changePassword(current, next); setCurrent(""); setNext(""); setConfirm(""); toast.success("Senha atualizada. As outras sessões foram encerradas."); } catch (error) { toast.error(errorText(error)); } finally { setPending(false); } }
   async function logout() { try { await api.logout(); } finally { onLogout(); } }
-  return <div className="page-enter"><PageHeader title="Ajustes" description="Segurança, dados e sessão." /><div className="mx-auto max-w-4xl px-5 sm:px-8 lg:px-12"><section className="grid gap-8 border-b border-border py-10 md:grid-cols-[15rem_1fr]"><div><ShieldCheck className="mb-4 size-6 text-primary" /><h2 className="text-xl font-medium">Senha da família</h2><p className="mt-2 text-sm leading-relaxed text-muted-foreground">Ao trocar, todas as outras sessões serão encerradas.</p></div><form onSubmit={changePassword} className="space-y-4"><div><Label htmlFor="current-password">Senha atual</Label><Input id="current-password" type="password" className="mt-2" value={current} onChange={(e) => setCurrent(e.target.value)} required /></div><div className="grid gap-4 sm:grid-cols-2"><div><Label htmlFor="new-password">Nova senha</Label><Input id="new-password" type="password" minLength={8} maxLength={128} className="mt-2" value={next} onChange={(e) => setNext(e.target.value)} required /></div><div><Label htmlFor="confirm-password">Confirmar senha</Label><Input id="confirm-password" type="password" minLength={8} maxLength={128} className="mt-2" value={confirm} onChange={(e) => setConfirm(e.target.value)} required /></div></div><Button disabled={pending}>{pending && <LoaderCircle className="animate-spin" />}Atualizar senha</Button></form></section><section className="grid gap-8 border-b border-border py-10 md:grid-cols-[15rem_1fr]"><div><Download className="mb-4 size-6 text-data" /><h2 className="text-xl font-medium">Exportar dados</h2><p className="mt-2 text-sm leading-relaxed text-muted-foreground">Baixe as compras de um ano em formato CSV.</p></div><div className="flex max-w-sm gap-2"><YearSelect year={year} years={years} onYear={onYear} /><Button variant="outline" onClick={() => void api.exportCsv(year).catch((error) => toast.error(errorText(error)))}><Download /> Baixar CSV</Button></div></section><section className="grid gap-8 py-10 md:grid-cols-[15rem_1fr]"><div><LogOut className="mb-4 size-6 text-highlight" /><h2 className="text-xl font-medium">Sessão</h2><p className="mt-2 text-sm leading-relaxed text-muted-foreground">Saia deste dispositivo com segurança.</p></div><div><Button variant="outline" onClick={() => void logout()}><LogOut /> Sair da Família Steam</Button></div></section></div></div>;
+  return <div className="page-enter"><PageHeader title="Ajustes" description="Segurança, dados e sessão." /><div className="mx-auto max-w-4xl px-5 sm:px-8 lg:px-12"><section className="grid gap-8 border-b border-border py-10 md:grid-cols-[15rem_1fr]"><div><ShieldCheck className="mb-4 size-6 text-primary" /><h2 className="text-xl font-medium">Senha da família</h2><p className="mt-2 text-sm leading-relaxed text-muted-foreground">Ao trocar, todas as outras sessões serão encerradas.</p></div><form onSubmit={changePassword} className="space-y-4"><div><Label htmlFor="current-password">Senha atual</Label><Input id="current-password" type="password" className="mt-2" value={current} onChange={(e) => setCurrent(e.target.value)} required /></div><div className="grid gap-4 sm:grid-cols-2"><div><Label htmlFor="new-password">Nova senha</Label><Input id="new-password" type="password" minLength={8} maxLength={128} className="mt-2" value={next} onChange={(e) => setNext(e.target.value)} required /></div><div><Label htmlFor="confirm-password">Confirmar senha</Label><Input id="confirm-password" type="password" minLength={8} maxLength={128} className="mt-2" value={confirm} onChange={(e) => setConfirm(e.target.value)} required /></div></div><Button disabled={pending}>{pending && <LoaderCircle className="animate-spin" />}Atualizar senha</Button></form></section><NextSaleSection /><section className="grid gap-8 border-b border-border py-10 md:grid-cols-[15rem_1fr]"><div><Download className="mb-4 size-6 text-data" /><h2 className="text-xl font-medium">Exportar dados</h2><p className="mt-2 text-sm leading-relaxed text-muted-foreground">Baixe as compras de um ano em formato CSV.</p></div><div className="flex max-w-sm gap-2"><YearSelect year={year} years={years} onYear={onYear} /><Button variant="outline" onClick={() => void api.exportCsv(year).catch((error) => toast.error(errorText(error)))}><Download /> Baixar CSV</Button></div></section><section className="grid gap-8 py-10 md:grid-cols-[15rem_1fr]"><div><LogOut className="mb-4 size-6 text-highlight" /><h2 className="text-xl font-medium">Sessão</h2><p className="mt-2 text-sm leading-relaxed text-muted-foreground">Saia deste dispositivo com segurança.</p></div><div><Button variant="outline" onClick={() => void logout()}><LogOut /> Sair da Família Steam</Button></div></section></div></div>;
+}
+
+const saleCountdown = new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "short", year: "numeric" });
+
+function NextSaleSection() {
+  const [saleAt, setSaleAt] = useState("");
+  const [label, setLabel] = useState("");
+  const [saved, setSaved] = useState<{ next_sale_at: string | null; label: string } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [pending, setPending] = useState(false);
+  useEffect(() => {
+    void api.nextSale()
+      .then((data) => {
+        setSaved(data);
+        setSaleAt(data.next_sale_at ? data.next_sale_at.slice(0, 16) : "");
+        setLabel(data.label ?? "");
+      })
+      .catch((error) => toast.error(errorText(error)))
+      .finally(() => setLoading(false));
+  }, []);
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setPending(true);
+    try {
+      // datetime-local entrega "2026-12-18T00:00"; backend normaliza para ISO.
+      // Vazio = null (limpa o temporizador).
+      const data = await api.updateNextSale(saleAt ? new Date(`${saleAt}:00`).toISOString() : null, label.trim());
+      setSaved(data);
+      toast.success(saleAt ? "Promoção salva." : "Temporizador limpo.");
+    } catch (error) { toast.error(errorText(error)); }
+    finally { setPending(false); }
+  }
+  const target = saved?.next_sale_at ? new Date(saved.next_sale_at).getTime() : null;
+  const daysLeft = target == null ? null : Math.max(0, Math.ceil((target - Date.now()) / 86400000));
+  return (
+    <section className="grid gap-8 border-b border-border py-10 md:grid-cols-[15rem_1fr]">
+      <div><CalendarDays className="mb-4 size-6 text-highlight" /><h2 className="text-xl font-medium">Próxima promoção</h2><p className="mt-2 text-sm leading-relaxed text-muted-foreground">Contagem regressiva para a próxima sale da Steam.</p></div>
+      <div>
+        {loading ? <Skeleton className="h-24 w-full max-w-sm" /> : (
+          <form onSubmit={submit} className="max-w-sm space-y-4">
+            {saved?.next_sale_at && daysLeft != null && (
+              <p className="text-sm text-muted-foreground">
+                <strong className="font-display text-xl tabular-nums text-primary">{daysLeft} {daysLeft === 1 ? "dia" : "dias"}</strong>{" "}
+                para {saved.label || "a promoção"} · {saleCountdown.format(new Date(saved.next_sale_at))}
+              </p>
+            )}
+            {!saved?.next_sale_at && <p className="text-sm text-muted-foreground">Nenhuma promoção marcada.</p>}
+            <div><Label htmlFor="next-sale-date">Data e hora</Label><Input id="next-sale-date" type="datetime-local" className="mt-2" value={saleAt} onChange={(e) => setSaleAt(e.target.value)} /></div>
+            <div><Label htmlFor="next-sale-label">Nome <span className="text-muted-foreground">(opcional)</span></Label><Input id="next-sale-label" className="mt-2" value={label} onChange={(e) => setLabel(e.target.value)} maxLength={80} placeholder="Promoção de Inverno" /></div>
+            <div className="flex gap-2">
+              <Button disabled={pending}>{pending && <LoaderCircle className="animate-spin" />}Salvar</Button>
+              {saved?.next_sale_at && <Button type="button" variant="outline" disabled={pending} onClick={() => { setSaleAt(""); setLabel(""); }}>Limpar</Button>}
+            </div>
+          </form>
+        )}
+      </div>
+    </section>
+  );
 }
 
 function PageSkeleton({ title }: { title: string }) { return <div><PageHeader title={title} description="Carregando as memórias da família." /><div className="space-y-8 px-5 py-10 sm:px-8 lg:px-12"><Skeleton className="h-44 w-full" /><Skeleton className="h-72 w-full" /><div className="grid gap-5 md:grid-cols-2"><Skeleton className="h-56" /><Skeleton className="h-56" /></div></div></div>; }

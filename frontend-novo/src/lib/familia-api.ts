@@ -6,6 +6,14 @@ export type Member = {
   bought: number;
   gifted: number;
   split_in: number;
+  spent_cents?: number;
+  badges?: string[];
+};
+
+export type MembersResponse = {
+  members: Member[];
+  year: number | null;
+  badge_year: number | null;
 };
 
 export type SplitMember = { id: number; name: string; avatar: string };
@@ -53,6 +61,7 @@ export type Stats = {
   totalCents?: number;
   freeCount?: number;
   avgCents?: number;
+  avgPaidCents?: number | null;
   giftCount?: number;
   splitCount?: number;
   perMonth?: Array<{ month: number; label: string; short: string; count: number; cents: number }>;
@@ -62,6 +71,35 @@ export type Stats = {
   receivers?: RankingEntry[];
   compulsive?: RankingEntry[];
   splits?: RankingEntry[];
+  monthlyKings?: Array<{
+    month: number;
+    label: string;
+    short: string;
+    count: number;
+    cents: number;
+    topCount: number;
+    tops: Array<{ member_id: number; name: string; avatar: string }>;
+  }>;
+  longestGap?: { days: number; from: string; to: string } | null;
+  previousYearComparison?: {
+    year: number;
+    previousYear: number;
+    totalCents: number;
+    previousTotalCents: number;
+    pctChange: number | null;
+    totalGames: number;
+    previousTotalGames: number;
+  } | null;
+  mostAnticipated?: {
+    id: number;
+    game_name: string;
+    header_image: string;
+    release_date: string;
+    purchase_date: string;
+    days_after_release: number;
+    buyer_name: string;
+    buyer_avatar: string;
+  } | null;
   priciest?: Array<{
     id: number;
     game_name: string;
@@ -138,6 +176,24 @@ async function request<T>(path: string, options: RequestInit = {}, retryCsrf = t
   return response.json() as Promise<T>;
 }
 
+export type CompareSide = {
+  id: number;
+  name: string;
+  avatar: string;
+  avatar_url: string;
+  bought: number;
+  cents: number;
+  gifted: number;
+  gifted_cents: number;
+  received: number;
+  received_cents: number;
+  splits: number;
+  splits_started: number;
+  splits_joined: number;
+};
+
+export type NextSale = { next_sale_at: string | null; label: string };
+
 export const api = {
   async me() {
     const data = await request<{ ok: true; csrf: string }>("/api/me");
@@ -163,7 +219,10 @@ export const api = {
       body: JSON.stringify({ current, new: next }),
     });
   },
-  members: () => request<{ members: Member[] }>("/api/members"),
+  members: (year?: number) => {
+    const params = year ? `?year=${year}` : "";
+    return request<MembersResponse>(`/api/members${params}`);
+  },
   addMember: (name: string) => request<{ ok: true; id: number }>("/api/members", { method: "POST", body: JSON.stringify({ name }) }),
   updateMember: (id: number, name: string) => request<{ ok: true }>(`/api/members/${id}`, { method: "PUT", body: JSON.stringify({ name }) }),
   deleteMember: (id: number) => request<{ ok: true }>(`/api/members/${id}`, { method: "DELETE" }),
@@ -171,6 +230,17 @@ export const api = {
   deleteAvatar: (id: number) => request<{ ok: true }>(`/api/members/${id}/avatar`, { method: "DELETE" }),
   years: () => request<{ years: number[] }>("/api/years"),
   stats: (year: number) => request<Stats>(`/api/stats?year=${year}`),
+  compareMembers: (a: number, b: number, year?: number) => {
+    const params = new URLSearchParams({ a: String(a), b: String(b) });
+    if (year) params.set("year", String(year));
+    return request<{ a: CompareSide; b: CompareSide; year: number | null }>(`/api/members/compare?${params}`);
+  },
+  nextSale: () => request<NextSale>("/api/settings/next-sale"),
+  updateNextSale: (next_sale_at: string | null, label: string) =>
+    request<{ ok: true; next_sale_at: string | null; label: string }>("/api/settings/next-sale", {
+      method: "PUT",
+      body: JSON.stringify({ next_sale_at, label }),
+    }),
   purchases: (year: number, member?: number, q?: string) => {
     const params = new URLSearchParams({ year: String(year) });
     if (member) params.set("member", String(member));
@@ -181,7 +251,7 @@ export const api = {
   updatePurchase: (id: number, data: PurchaseInput) => request<{ ok: true }>(`/api/purchases/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   deletePurchase: (id: number) => request<{ ok: true }>(`/api/purchases/${id}`, { method: "DELETE" }),
   searchSteam: (q: string) => request<{ results: SteamResult[] }>(`/api/steam/search?q=${encodeURIComponent(q)}`),
-  lookupSteam: (appid: number) => request<{ appid: number; name: string; header_image: string; current_price_cents: number | null }>(`/api/steam/lookup?appid=${appid}`),
+  lookupSteam: (appid: number) => request<{ appid: number; name: string; header_image: string; current_price_cents: number | null; release_date?: string | null }>(`/api/steam/lookup?appid=${appid}`),
   async exportCsv(year: number) {
     const response = await fetch(`${API_BASE}/api/export.csv?year=${year}`, { credentials: "include" });
     if (!response.ok) throw new ApiError(await parseError(response), response.status);
